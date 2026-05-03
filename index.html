@@ -3099,6 +3099,13 @@
       "localMeta"
     ];
 
+
+    /* oskar-speedfix-2026-05-03: keep one IndexedDB connection open instead of opening it on every save. */
+    let __oskarDbHandle = null;
+    let __oskarDbPromise = null;
+    let __oskarPendingCountTimer = null;
+    let __oskarBackgroundSyncTimer = null;
+
     const AUTH_SESSION_KEY = `cashier_auth_session_${DB_NAMESPACE}_v1`;
     const ADMIN_PROFILE_ID = "admin";
     const DEFAULT_ADMIN_PIN = "0000000000@@";
@@ -4006,9 +4013,32 @@
     }
 
     function openDB() {
-      return new Promise((resolve, reject) => {
-        openIndexedDbWithVersion(DB_VERSION, resolve, reject);
+      if (__oskarDbHandle) return Promise.resolve(__oskarDbHandle);
+      if (__oskarDbPromise) return __oskarDbPromise;
+
+      __oskarDbPromise = new Promise((resolve, reject) => {
+        openIndexedDbWithVersion(
+          DB_VERSION,
+          (database) => {
+            __oskarDbHandle = database;
+            try {
+              database.onversionchange = () => {
+                try { database.close(); } catch {}
+                __oskarDbHandle = null;
+                __oskarDbPromise = null;
+              };
+            } catch {}
+            resolve(database);
+          },
+          (err) => {
+            __oskarDbHandle = null;
+            __oskarDbPromise = null;
+            reject(err);
+          }
+        );
       });
+
+      return __oskarDbPromise;
     }
 
     async function idbPut(storeName, value) {
@@ -4032,6 +4062,62 @@
         tx.oncomplete = () => resolve(true);
         tx.onerror = () => reject(tx.error);
       });
+    }
+
+
+    async function saveLocalBatch(ops = [], sync = true) {
+      const now = Date.now();
+      const validOps = (Array.isArray(ops) ? ops : [])
+        .filter(op => op && op.store && op.item && op.item.id)
+        .map((op, index) => ({
+          store: op.store,
+          syncMeta: op.syncMeta || {},
+          item: {
+            ...op.item,
+            updatedAt: Math.max(Number(op.item.updatedAt || op.item.createdAt || 0), now + index)
+          }
+        }));
+
+      if (!validOps.length) return [];
+
+      const database = await openDB();
+      const txStores = Array.from(new Set([
+        ...validOps.map(op => op.store),
+        ...(sync && !OSKAR_TRIAL_LOCAL_ONLY ? ["syncQueue"] : [])
+      ])).filter(store => STORE_NAMES.includes(store));
+
+      await new Promise((resolve, reject) => {
+        const tx = database.transaction(txStores, "readwrite");
+        const queueStore = (sync && !OSKAR_TRIAL_LOCAL_ONLY && txStores.includes("syncQueue")) ? tx.objectStore("syncQueue") : null;
+
+        validOps.forEach((op, index) => {
+          tx.objectStore(op.store).put(op.item);
+
+          if (queueStore) {
+            queueStore.put({
+              id: uid("queue"),
+              type: "set",
+              store: op.store,
+              itemId: op.item.id,
+              data: op.item,
+              syncMeta: op.syncMeta || {},
+              createdAt: now + index,
+              tries: 0
+            });
+          }
+        });
+
+        tx.oncomplete = () => resolve(true);
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error || new Error("IndexedDB transaction aborted"));
+      });
+
+      if (sync && !OSKAR_TRIAL_LOCAL_ONLY) {
+        schedulePendingCountRefresh(80);
+        scheduleBackgroundSync(650);
+      }
+
+      return validOps.map(op => op.item);
     }
 
     async function idbGet(storeName, id) {
@@ -4141,6 +4227,24 @@
       }, delay);
     }
 
+
+    function schedulePendingCountRefresh(delay = 80) {
+      clearTimeout(__oskarPendingCountTimer);
+      __oskarPendingCountTimer = setTimeout(() => {
+        refreshPendingCount().catch(e => console.warn("pending count refresh failed", e));
+      }, delay);
+    }
+
+    function scheduleBackgroundSync(delay = 650) {
+      if (OSKAR_TRIAL_LOCAL_ONLY || !navigator.onLine) return;
+      clearTimeout(__oskarBackgroundSyncTimer);
+      __oskarBackgroundSyncTimer = setTimeout(() => {
+        if (!state.syncing && currentUser()) {
+          syncNow(false).catch(e => console.warn("background sync failed", e));
+        }
+      }, delay);
+    }
+
     async function refreshPendingCount() {
       if (OSKAR_TRIAL_LOCAL_ONLY) {
         try { await idbClear("syncQueue"); } catch {}
@@ -4161,7 +4265,7 @@
     }
 
     async function enqueueSync(action) {
-      if (OSKAR_TRIAL_LOCAL_ONLY) { await refreshPendingCount(); return; }
+      if (OSKAR_TRIAL_LOCAL_ONLY) { schedulePendingCountRefresh(80); return; }
       const item = {
         id: uid("queue"),
         ...action,
@@ -4170,32 +4274,14 @@
       };
 
       await idbPut("syncQueue", item);
-      await refreshPendingCount();
-
-      if (navigator.onLine) {
-        setTimeout(() => syncNow(false), 120);
-      }
+      schedulePendingCountRefresh(80);
+      scheduleBackgroundSync(650);
     }
 
     async function saveLocal(store, item, sync = true, syncMeta = {}) {
       if (!item || !item.id) return;
-
-      const localItem = {
-        ...item,
-        updatedAt: Math.max(Number(item.updatedAt || item.createdAt || 0), Date.now())
-      };
-
-      await idbPut(store, localItem);
-
-      if (sync) {
-        await enqueueSync({
-          type: "set",
-          store,
-          itemId: localItem.id,
-          data: localItem,
-          syncMeta: syncMeta || {}
-        });
-      }
+      const saved = await saveLocalBatch([{ store, item, syncMeta: syncMeta || {} }], sync);
+      return saved[0] || null;
     }
 
     async function removeLocal(store, id, sync = true) {
@@ -4767,6 +4853,13 @@
       deltaMap.set(productId, cleanNumber(deltaMap.get(productId) || 0) + v);
     }
 
+
+    function oskarCfMarkTouchedItem(touchedItems, store, itemId) {
+      if (!store || !itemId) return;
+      if (!touchedItems[store]) touchedItems[store] = new Set();
+      touchedItems[store].add(String(itemId));
+    }
+
     function oskarCfInvoiceStockDelta(oldInvoice, newInvoice, deltaMap) {
       if (oldInvoice && oldInvoice.source === "cart") {
         (oldInvoice.items || []).forEach(item => {
@@ -4813,8 +4906,10 @@
       return oskarCfObjToMap(snap.exists() ? (snap.val() || {}) : {});
     }
 
-    async function oskarCfCommitMapToLocal(store, map) {
+    async function oskarCfCommitMapToLocal(store, map, onlyIds = null) {
       if (!map) return;
+      const idsFilter = onlyIds && onlyIds.size ? new Set(Array.from(onlyIds).map(String)) : null;
+
       if (store === "settings") {
         const settings = { ...defaultSettings, ...(map.main || state.settings || {}), id: "main" };
         await idbPut("settings", settings);
@@ -4824,15 +4919,45 @@
       }
 
       const stateKey = oskarCfStateKey(store);
+
+      if (idsFilter) {
+        if (!Array.isArray(state[stateKey])) state[stateKey] = [];
+        for (const id of idsFilter) {
+          const item = map[id];
+          if (item) {
+            const normalized = oskarCfNormalize(store, item);
+            await idbPut(store, normalized);
+            const idx = state[stateKey].findIndex(x => String(x.id) === String(id));
+            if (idx >= 0) state[stateKey][idx] = normalized;
+            else state[stateKey].push(normalized);
+          } else {
+            await idbDelete(store, id);
+            state[stateKey] = state[stateKey].filter(x => String(x.id) !== String(id));
+          }
+        }
+        return;
+      }
+
       const values = Object.values(map).filter(Boolean).map(item => oskarCfNormalize(store, item));
       await idbClear(store);
-      for (const item of values) await idbPut(store, item);
+      await idbBulkPut(store, values);
       if (Array.isArray(state[stateKey])) state[stateKey] = values;
     }
 
     async function oskarCfPrepareCloudFirstPlan(queue) {
-      const storesToFetch = new Set(OSKAR_CLOUD_FIRST_SYNC_STORES);
-      queue.forEach(q => { if (q?.store) storesToFetch.add(q.store); });
+      const storesToFetch = new Set();
+      (queue || []).forEach(q => {
+        if (!q?.store) return;
+        storesToFetch.add(q.store);
+        if (q.store === "invoices") {
+          storesToFetch.add("products");
+          storesToFetch.add("customers");
+        }
+        if (q.store === "purchases") {
+          storesToFetch.add("products");
+        }
+      });
+      if (!storesToFetch.size) storesToFetch.add("settings");
 
       const maps = {};
       let fetched = 0;
@@ -4849,6 +4974,8 @@
 
       const initialRemoteProductIds = new Set(Object.keys(maps.products || {}));
       const touchedStores = new Set();
+      const touchedItems = {};
+      const markTouched = (store, itemId) => oskarCfMarkTouchedItem(touchedItems, store, itemId);
       const removals = [];
       const latestProductLocal = new Map();
       const latestProductLocalMeta = new Map();
@@ -4865,13 +4992,19 @@
         if (!maps[store]) maps[store] = {};
 
         if (q.type === "remove") {
+          markTouched(store, itemId);
           if (store === "invoices") {
-            oskarCfInvoiceStockDelta(maps.invoices?.[itemId], null, stockDelta);
+            const oldInvoice = maps.invoices?.[itemId];
+            oskarCfInvoiceStockDelta(oldInvoice, null, stockDelta);
+            (oldInvoice?.items || []).forEach(item => markTouched("products", item.productId));
+            if (oldInvoice?.customerId) markTouched("customers", oldInvoice.customerId);
             touchedStores.add("products");
             touchedStores.add("customers");
           }
           if (store === "purchases") {
-            oskarCfPurchaseStockDelta(maps.purchases?.[itemId], null, stockDelta);
+            const oldPurchase = maps.purchases?.[itemId];
+            oskarCfPurchaseStockDelta(oldPurchase, null, stockDelta);
+            if (oldPurchase?.productId) markTouched("products", oldPurchase.productId);
             touchedStores.add("products");
           }
           if (store === "products") removedProducts.add(itemId);
@@ -4887,41 +5020,55 @@
           latestProductLocal.set(itemId, data);
           latestProductLocalMeta.set(itemId, q.syncMeta || q.meta || {});
           touchedStores.add("products");
+          markTouched("products", itemId);
           continue;
         }
 
         if (store === "customers") {
           maps.customers[itemId] = oskarCfMergeCustomer(maps.customers?.[itemId], data);
           touchedStores.add("customers");
+          markTouched("customers", itemId);
           continue;
         }
 
         if (store === "invoices") {
+          const oldInvoice = maps.invoices?.[itemId];
           data = oskarCfEnsureUniqueInvoiceNumber(data, maps.invoices || {});
-          oskarCfInvoiceStockDelta(maps.invoices?.[itemId], data, stockDelta);
+          oskarCfInvoiceStockDelta(oldInvoice, data, stockDelta);
           maps.invoices[itemId] = data;
           touchedStores.add("invoices");
           touchedStores.add("products");
           touchedStores.add("customers");
+          markTouched("invoices", itemId);
+          if (oldInvoice?.customerId) markTouched("customers", oldInvoice.customerId);
+          if (data.customerId) markTouched("customers", data.customerId);
+          (oldInvoice?.items || []).forEach(item => markTouched("products", item.productId));
+          (data.items || []).forEach(item => markTouched("products", item.productId));
           continue;
         }
 
         if (store === "purchases") {
-          oskarCfPurchaseStockDelta(maps.purchases?.[itemId], data, stockDelta);
+          const oldPurchase = maps.purchases?.[itemId];
+          oskarCfPurchaseStockDelta(oldPurchase, data, stockDelta);
           maps.purchases[itemId] = data;
           touchedStores.add("purchases");
           touchedStores.add("products");
+          markTouched("purchases", itemId);
+          if (oldPurchase?.productId) markTouched("products", oldPurchase.productId);
+          if (data.productId) markTouched("products", data.productId);
           continue;
         }
 
         if (store === "settings") {
           maps.settings[itemId] = stripLocalOnlySettings({ ...(maps.settings[itemId] || {}), ...data, id: itemId });
           touchedStores.add("settings");
+          markTouched("settings", itemId);
           continue;
         }
 
         maps[store][itemId] = data;
         touchedStores.add(store);
+        markTouched(store, itemId);
       }
 
       latestProductLocal.forEach((localProduct, productId) => {
@@ -4953,9 +5100,11 @@
         } else {
           maps.products[productId] = normalizeProduct(localProduct);
         }
+        markTouched("products", productId);
       });
 
       stockDelta.forEach((delta, productId) => {
+        markTouched("products", productId);
         if (!maps.products || !maps.products[productId] || removedProducts.has(productId) || absoluteStockProductIds.has(productId)) return;
         if (initialRemoteProductIds.has(productId)) {
           maps.products[productId] = normalizeProduct({
@@ -4967,21 +5116,25 @@
       });
 
       for (const store of storesToFetch) {
-        if (maps[store]) await oskarCfCommitMapToLocal(store, maps[store]);
+        if (maps[store]) await oskarCfCommitMapToLocal(store, maps[store], touchedItems[store]);
       }
 
       if (typeof rebuildCustomerBalances === "function") {
         rebuildCustomerBalances(false);
-        maps.customers = {};
-        for (const customer of state.customers || []) {
-          const normalized = normalizeCustomer(customer);
-          maps.customers[normalized.id] = normalized;
-          await idbPut("customers", normalized);
+        const customerIds = touchedItems.customers || new Set();
+        maps.customers = maps.customers || {};
+        if (customerIds.size) {
+          for (const customer of state.customers || []) {
+            if (!customerIds.has(String(customer.id))) continue;
+            const normalized = normalizeCustomer(customer);
+            maps.customers[normalized.id] = normalized;
+            await idbPut("customers", normalized);
+          }
+          touchedStores.add("customers");
         }
-        touchedStores.add("customers");
       }
 
-      return { maps, touchedStores, removals };
+      return { maps, touchedStores, removals, touchedItems };
     }
 
     async function oskarCfUploadPlan(plan, queue) {
@@ -4997,7 +5150,11 @@
       touched.forEach(store => {
         const map = plan.maps?.[store];
         if (!map) return;
-        Object.values(map).forEach(item => {
+        const touchedIds = plan.touchedItems?.[store];
+        const items = touchedIds && touchedIds.size
+          ? Array.from(touchedIds).map(id => map[id]).filter(Boolean)
+          : Object.values(map);
+        items.forEach(item => {
           if (!item || !item.id) return;
           let data = oskarCfNormalize(store, item);
           if (store === "settings") data = stripLocalOnlySettings(data);
@@ -5031,8 +5188,23 @@
         });
       }
 
-      for (const q of queue) await idbDelete("syncQueue", q.id);
+      const deleteQueue = queue.__rawQueue || queue;
+      for (const q of deleteQueue) await idbDelete("syncQueue", q.id);
       await refreshPendingCount();
+    }
+
+    function compactSyncQueue(queue = []) {
+      const sorted = (Array.isArray(queue) ? queue : []).slice().sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0));
+      const map = new Map();
+      sorted.forEach(q => {
+        if (!q || !q.store || !q.itemId) return;
+        const key = `${q.store}::${q.itemId}`;
+        const old = map.get(key);
+        if (!old || Number(q.createdAt || 0) >= Number(old.createdAt || 0)) map.set(key, q);
+      });
+      const compacted = Array.from(map.values()).sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0));
+      compacted.__rawQueue = sorted;
+      return compacted;
     }
 
     async function syncNow(showPopover = false) {
@@ -5054,7 +5226,8 @@
         return;
       }
 
-      const queue = await idbGetAll("syncQueue");
+      const rawQueue = await idbGetAll("syncQueue");
+      const queue = compactSyncQueue(rawQueue);
       if (!queue.length) {
         await refreshPendingCount();
         if (showPopover) {
@@ -6107,7 +6280,22 @@
       return Math.max(lastInv, lastPay, lastManual, Number(c.updatedAt || 0));
     }
 
+    function customerPersistSignature(c = {}) {
+      return JSON.stringify({
+        name: c.name || "",
+        phone: c.phone || "",
+        balance: cleanNumber(c.balance),
+        totalSales: cleanNumber(c.totalSales),
+        totalPaid: cleanNumber(c.totalPaid),
+        invoicesCount: cleanNumber(c.invoicesCount),
+        payments: c.payments || [],
+        manualDebts: c.manualDebts || [],
+        dueDate: c.dueDate || ""
+      });
+    }
+
     function rebuildCustomerBalances(save = true) {
+      const beforeSignatures = new Map((state.customers || []).map(c => [c.id, customerPersistSignature(normalizeCustomer(c))]));
       const map = new Map(state.customers.map(c => [c.id, normalizeCustomer(c)]));
 
       for (const c of map.values()) {
@@ -6164,7 +6352,11 @@
       state.customers = [...map.values()].map(normalizeCustomer);
 
       if (save) {
-        state.customers.forEach(c => saveLocal("customers", c, true));
+        const changedCustomers = state.customers.filter(c => beforeSignatures.get(c.id) !== customerPersistSignature(c));
+        if (changedCustomers.length) {
+          saveLocalBatch(changedCustomers.map(c => ({ store: "customers", item: c })), true)
+            .catch(e => console.warn("customer balance batch save failed", e));
+        }
       }
     }
     function renderDebts() {
@@ -7035,25 +7227,26 @@
           updatedAt: Date.now()
         });
 
+        const invoiceOps = [];
         state.invoices.forEach(inv => {
           if (old.id && inv.customerId === old.id) {
             inv.customerName = item.name;
             inv.customerPhone = item.phone;
             inv.updatedAt = Date.now();
-            saveLocal("invoices", inv, true);
+            invoiceOps.push({ store: "invoices", item: inv });
           }
         });
-
-        await saveLocal("customers", item, true);
 
         const i = state.customers.findIndex(c => c.id === item.id);
         if (i >= 0) state.customers[i] = item;
         else state.customers.push(item);
 
-        rebuildCustomerBalances(true);
+        rebuildCustomerBalances(false);
+        const finalCustomer = normalizeCustomer(state.customers.find(c => c.id === item.id) || item);
+        await saveLocalBatch([...invoiceOps, { store: "customers", item: finalCustomer }], true);
         closeModal();
         renderAll();
-        toast("تم حفظ حساب الزبون وإعادة الحسابات");
+        toast("تم حفظ حساب الزبون فوراً");
       };
     }
 
@@ -7603,133 +7796,150 @@
     }
 
     async function saveSaleWithPayment(payment) {
-      const source = payment.source || "cart";
-
-      if (source === "cart") {
-        if (!state.cart.length) return toast("السلة فارغة");
-        if (!validateStockForCart()) return;
+      if (state.__saleSaving) {
+        toast("جاري حفظ الفاتورة، انتظر لحظة...");
+        return;
       }
+      state.__saleSaving = true;
 
-      if (source === "free") {
-        syncFreeLinesFromDom();
+      try {
+        const source = payment.source || "cart";
 
-        if (!state.freeLines.some(x => x.name && cleanNumber(x.price) > 0)) {
-          return toast("الفاتورة المباشرة فارغة");
-        }
-      }
-
-      const totals = source === "free" ? getFreeInvoiceTotals() : calculateCartTotals();
-
-      const invoiceNumber =
-        (state.invoices.length ? Math.max(...state.invoices.map(x => cleanNumber(x.number))) : 0) + 1;
-
-      const items = buildSaleItems(source);
-
-      const invoice = {
-        id: uid("inv"),
-        number: invoiceNumber,
-        dateKey: todayKey(),
-        source,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        employeeId: currentUser()?.id || "",
-        employeeName: currentUser()?.name || "",
-        customerId: payment.customerId || "",
-        customerName: payment.customerName || "",
-        customerPhone: payment.customerPhone || "",
-        paymentMethod: payment.paymentMethod,
-        paymentAccountId: payment.paymentAccountId || "",
-        dueDate: payment.dueDate || "",
-        status: payment.status || "unpaid",
-        notes: "",
-        items,
-        subtotal: totals.subtotal,
-        discount: totals.discount,
-        total: totals.total,
-        cost: totals.cost,
-        profit: totals.profit
-      };
-
-      const changedProducts = [];
-
-      if (source === "cart") {
-        for (const line of state.cart) {
-          const product = getProductById(line.productId);
-          if (!product) continue;
-
-          product.stock = cleanNumber(product.stock) - cleanNumber(line.baseQty);
-          product.updatedAt = Date.now();
-          changedProducts.push(normalizeProduct(product));
-        }
-      }
-
-      if (["debt", "later_app"].includes(payment.paymentMethod)) {
-        let customer = payment.customerId
-          ? state.customers.find(c => c.id === payment.customerId)
-          : findCustomerByNameOrPhone(payment.customerName, payment.customerPhone);
-
-        if (!customer) {
-          customer = normalizeCustomer({
-            id: uid("cus"),
-            name: payment.customerName || "زبون",
-            phone: payment.customerPhone || "",
-            createdAt: Date.now(),
-            updatedAt: Date.now()
-          });
-
-          state.customers.push(customer);
+        if (source === "cart") {
+          if (!state.cart.length) return toast("السلة فارغة");
+          if (!validateStockForCart()) return;
         }
 
-        customer.name = payment.customerName || customer.name;
-        customer.phone = payment.customerPhone || customer.phone;
-        customer.updatedAt = Date.now();
+        if (source === "free") {
+          syncFreeLinesFromDom();
 
-        invoice.customerId = customer.id;
-        invoice.customerName = customer.name;
-        invoice.customerPhone = customer.phone;
+          if (!state.freeLines.some(x => x.name && cleanNumber(x.price) > 0)) {
+            return toast("الفاتورة المباشرة فارغة");
+          }
+        }
 
-        await saveLocal("customers", normalizeCustomer(customer), true);
-      }
+        const totals = source === "free" ? getFreeInvoiceTotals() : calculateCartTotals();
 
-      if (payment.paymentMethod === "instant_app" && (payment.customerName || payment.customerPhone)) {
-        let customer = findCustomerByNameOrPhone(payment.customerName, payment.customerPhone);
+        const invoiceNumber =
+          (state.invoices.length ? Math.max(...state.invoices.map(x => cleanNumber(x.number))) : 0) + 1;
 
-        if (customer) {
+        const items = buildSaleItems(source);
+
+        const invoice = {
+          id: uid("inv"),
+          number: invoiceNumber,
+          dateKey: todayKey(),
+          source,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          employeeId: currentUser()?.id || "",
+          employeeName: currentUser()?.name || "",
+          customerId: payment.customerId || "",
+          customerName: payment.customerName || "",
+          customerPhone: payment.customerPhone || "",
+          paymentMethod: payment.paymentMethod,
+          paymentAccountId: payment.paymentAccountId || "",
+          dueDate: payment.dueDate || "",
+          status: payment.status || "unpaid",
+          notes: "",
+          items,
+          subtotal: totals.subtotal,
+          discount: totals.discount,
+          total: totals.total,
+          cost: totals.cost,
+          profit: totals.profit
+        };
+
+        const changedProducts = [];
+
+        if (source === "cart") {
+          for (const line of state.cart) {
+            const product = getProductById(line.productId);
+            if (!product) continue;
+
+            product.stock = cleanNumber(product.stock) - cleanNumber(line.baseQty);
+            product.updatedAt = Date.now();
+            changedProducts.push(normalizeProduct(product));
+          }
+        }
+
+        if (["debt", "later_app"].includes(payment.paymentMethod)) {
+          let customer = payment.customerId
+            ? state.customers.find(c => c.id === payment.customerId)
+            : findCustomerByNameOrPhone(payment.customerName, payment.customerPhone);
+
+          if (!customer) {
+            customer = normalizeCustomer({
+              id: uid("cus"),
+              name: payment.customerName || "زبون",
+              phone: payment.customerPhone || "",
+              createdAt: Date.now(),
+              updatedAt: Date.now()
+            });
+
+            state.customers.push(customer);
+          }
+
           customer.name = payment.customerName || customer.name;
           customer.phone = payment.customerPhone || customer.phone;
           customer.updatedAt = Date.now();
 
           invoice.customerId = customer.id;
-          await saveLocal("customers", normalizeCustomer(customer), true);
+          invoice.customerName = customer.name;
+          invoice.customerPhone = customer.phone;
         }
-      }
 
-      await saveLocal("invoices", invoice, true);
+        if (payment.paymentMethod === "instant_app" && (payment.customerName || payment.customerPhone)) {
+          let customer = findCustomerByNameOrPhone(payment.customerName, payment.customerPhone);
 
-      for (const p of changedProducts) {
-        await saveLocal("products", p, true);
-      }
+          if (customer) {
+            customer.name = payment.customerName || customer.name;
+            customer.phone = payment.customerPhone || customer.phone;
+            customer.updatedAt = Date.now();
 
-      state.invoices.push(invoice);
-      state.products = state.products.map(p => changedProducts.find(x => x.id === p.id) || p);
+            invoice.customerId = customer.id;
+            invoice.customerName = customer.name;
+            invoice.customerPhone = customer.phone;
+          }
+        }
 
-      rebuildCustomerBalances(true);
+        state.invoices.push(invoice);
+        state.products = state.products.map(p => changedProducts.find(x => x.id === p.id) || p);
+        rebuildCustomerBalances(false);
 
-      if (source === "cart") {
-        state.cart = [];
-      } else {
-        state.freeLines = [{ id: uid("free"), name: "", qty: 1, cost: 0, price: 0 }];
-      }
+        const persistOps = [
+          { store: "invoices", item: invoice },
+          ...changedProducts.map(p => ({ store: "products", item: p }))
+        ];
 
-      renderAll();
-      toast("تم حفظ الفاتورة بنجاح");
+        if (invoice.customerId) {
+          const customerAfterBalance = state.customers.find(c => c.id === invoice.customerId);
+          if (customerAfterBalance) persistOps.push({ store: "customers", item: normalizeCustomer(customerAfterBalance) });
+        }
 
-      if (["debt", "later_app"].includes(payment.paymentMethod) && invoice.customerId) {
-        closeModal();
-        switchPage("debts");
-        setTimeout(() => openCustomerAccount(invoice.customerId), 180);
-      } else {
-        openInvoiceView(invoice);
+        await saveLocalBatch(persistOps, true);
+
+        if (source === "cart") {
+          state.cart = [];
+        } else {
+          state.freeLines = [{ id: uid("free"), name: "", qty: 1, cost: 0, price: 0 }];
+        }
+
+        renderAll();
+        toast("تم حفظ الفاتورة فوراً، والمزامنة تعمل بالخلفية");
+
+        if (["debt", "later_app"].includes(payment.paymentMethod) && invoice.customerId) {
+          closeModal();
+          switchPage("debts");
+          setTimeout(() => openCustomerAccount(invoice.customerId), 180);
+        } else {
+          openInvoiceView(invoice);
+        }
+      } catch (e) {
+        console.error("save sale failed", e);
+        toast("تعذر حفظ الفاتورة محلياً");
+      } finally {
+        state.__saleSaving = false;
       }
     }
 
@@ -10877,6 +11087,7 @@
       idbGetAll,
       idbDelete,
       idbClear,
+      saveLocalBatch,
       saveLocal,
       removeLocal,
       enqueueSync,
